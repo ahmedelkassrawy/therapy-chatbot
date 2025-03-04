@@ -8,8 +8,6 @@ from langchain.prompts import ChatPromptTemplate
 from langchain.schema import StrOutputParser
 from langchain_core.messages import HumanMessage, AIMessage
 
-load_dotenv()
-
 st.set_page_config(layout="wide", page_title="رفيق التحرر", page_icon="😇")
 
 # Align the title to the right
