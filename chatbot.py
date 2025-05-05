@@ -1,78 +1,133 @@
-import streamlit as st
-import os
-import langchain
+from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
+from langchain_qdrant import QdrantVectorStore
 from langchain_google_genai import ChatGoogleGenerativeAI
+from qdrant_client import QdrantClient
+from langchain_community.document_loaders import WebBaseLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain.tools.retriever import create_retriever_tool
+from langgraph.graph import StateGraph, START, END, MessagesState
+from langgraph.prebuilt import ToolNode, tools_condition
+from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from langchain.prompts import ChatPromptTemplate
-from langchain.schema import StrOutputParser
-from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
+from langchain import hub
+from pydantic import BaseModel, Field
+from typing import Literal
+from functools import partial
+import os
 
-st.set_page_config(layout="wide", page_title="رفيق التحرر", page_icon="😇")
+os.environ["GOOGLE_API_KEY"] = "AIzaSyB38nvrIt6MFrEchALd6Eouz9UHVrt9Tso"
+llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash")
 
-# Align the title to the right
-st.markdown(
-    """
-    <div style='text-align: right;'>
-        <h1>رفيق التحرر</h1>
-    </div>
-    """,
-    unsafe_allow_html=True
-)
-
-
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
-
-
-@st.cache_resource
-def get_response(query, _chat_history):
-
-    google_key = "AIzaSyABKZahODIzOmguP5F6Xx_NbMggaVg-9d0"
-
-    llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash-001",
-                                google_api_key = google_key)
-
-    followup_prompt = ChatPromptTemplate.from_template(
-        """
-                You are "رفيق التحرر", a therapist with a sharp tongue and a deep understanding of the human mind. You help people navigate life's psychological traps, but instead of soft, comforting words, you use sarcasm, dark humor, and brutal honesty—all wrapped in a therapist’s tone.
-                Your specialty? Exposing the ridiculous yet deeply human ways people fall into psychological pitfalls—whether it’s social media addiction, toxic relationships, procrastination, or just the daily existential crisis. You don’t sugarcoat things; instead, you highlight the absurdity of their struggles in a way that makes them laugh… and then immediately rethink their entire life.
-                When users share their problems, you respond like a therapist who's seen it all before—mocking the problem, not the person—so they can step back and see how they’re being played by their own brain (or by the systems manipulating them). You subtly guide them to the realization without outright saying "you’re addicted" or "you’re the problem." Instead, they figure it out themselves.
-                You use insights from The Social Dilemma, psychology research, and life's general nonsense, speaking in Arabic, English, or Egyptian Arabic—but never mixing languages in one response.
-                Your tone? A mix of a fed-up therapist, a comedian, and a brutally honest friend. Short, sharp, and straight to the point.
-                
-                
-                Current conversation:
-                {_chat_history}
-
-                User: {question}
-                Social media bot: 
-        """
+class MessageClassifier(BaseModel):
+    message_type : Literal["emotional","logical"] = Field(
+        ...,
+        description = "Classify if message requeries an emotional(therapist) or logical"
     )
 
-# Create the followup chain
-    followup_chain = followup_prompt | llm | StrOutputParser()
-    answer = followup_chain.stream(
-        {"question": query, "_chat_history": _chat_history})
-    return answer
+class State(MessagesState):
+    message_type: str | None
 
 
-for message in st.session_state.chat_history:
-    if isinstance(message, HumanMessage):
-        with st.chat_message("User"):
-            st.markdown(message.content)
-    elif isinstance(message, AIMessage):
-        with st.chat_message("Bot"):
-            st.markdown(message.content)
+def classify_message(state: State):
+    last_message = state["messages"][-1]
+    classifier_llm = llm.with_structured_output(MessageClassifier)
 
-user_query = st.chat_input("I'm here to help you.")
+    # Pass a list of messages instead of a dictionary
+    response = classifier_llm.invoke([
+        SystemMessage(content="""Classify the user message as either:
+                          - 'emotional': if it asks for emotional support, therapy, deals with feelings or personal problems.
+                          - 'logical': if it asks for facts, advice, information, logical analysis, or practical solutions.
+                          """),
+        HumanMessage(content=last_message.content)
+    ])
 
-if user_query is not None and user_query != "":
-    st.session_state.chat_history.append(HumanMessage(user_query))
-    with st.chat_message("User"):
-        st.markdown(user_query)
-    with st.chat_message("Bot"):
-        with st.spinner("Thinking..."):
-            ai_response = get_response(
-                user_query, st.session_state.chat_history)
-        stream = st.write_stream(ai_response)
-    st.session_state.chat_history.append(AIMessage(stream))
+    # Access the message_type attribute directly
+    return {"message_type": response.message_type}
+
+def router(state:State):
+    if state["message_type"] == "emotional":
+        return {"next":"therapist"}
+    elif state["message_type"] == "logical":
+        return {"next":"logical"}
+    else:
+        raise ValueError("Invalid message type")
+
+def therapist_agent(state: State):
+    last_message = state["messages"][-1]
+
+    messages = [
+        SystemMessage(content="""You are a compassionate therapist. Focus on the emotional aspects of the user's message.
+                        Show empathy, validate their feelings, and help them process their emotions.
+                        Ask thoughtful questions to help them explore their feelings more deeply.
+                        Avoid giving logical solutions unless explicitly asked."""),
+        HumanMessage(content=last_message.content)
+    ]
+
+    response = llm.invoke(messages)
+    return {"messages": [AIMessage(content=response.content)]}
+
+def logical_agent(state: State):
+    last_message = state["messages"][-1]
+
+    messages = [
+        SystemMessage(content="""You are a purely logical assistant. Focus only on facts and information.
+            Provide clear, concise answers based on logic and evidence.
+            Do not address emotions or provide emotional support.
+            Be direct and straightforward in your responses."""),
+        HumanMessage(content=last_message.content)
+    ]
+
+    response = llm.invoke(messages)
+    return {"messages": [AIMessage(content=response.content)]}
+
+
+
+def chatbot(state:State):
+    return {"messages":[llm.invoke(state["messages"])]}
+
+builder = StateGraph(State)
+
+builder.add_node("classifier", classify_message)
+builder.add_node("router", router)
+builder.add_node("therapist", therapist_agent)
+builder.add_node("logical", logical_agent)
+
+builder.add_edge(START, "classifier")
+builder.add_edge("classifier", "router")
+
+builder.add_conditional_edges(
+    "router",
+    lambda state: state.get("next"),
+    {"therapist": "therapist", "logical": "logical"}
+)
+
+builder.add_edge("therapist", END)
+builder.add_edge("logical", END)
+
+graph = builder.compile()
+
+def run_chatbot():
+    state = {
+        "messages" : [],
+        "message_type": None
+    }
+
+    while True:
+        user_input = input("Message: ")
+
+        if user_input.lower() == "exit":
+            print("Bye.")
+            break
+
+        state["messages"].append(HumanMessage(content=user_input))
+
+        state = graph.invoke(state)
+
+        if state.get("messages") and len(state["messages"]) > 0:
+            last_message = state["messages"][-1]
+            print(f"Assistant: {last_message.content}")
+
+
+if __name__ == "__main__":
+    run_chatbot()
